@@ -1,0 +1,157 @@
+# =============================================================
+# Eirdom Intelligence — Foundation Stack
+# Open WebUI + Qdrant (vector RAG) + MCPO (MCP gateway)
+# Ollama currently runs on the HOST (host.docker.internal).
+#
+# Bindings use ${DOCKER_BIND_IP} + *_PORT_BIND from .env, so the
+# whole stack is localhost-only today (DOCKER_BIND_IP=127.0.0.1)
+# and a one-line change when you move to a dedicated server.
+#
+# ===== MOVING TO A LARGER, GPU-CAPABLE DOCKER SERVER =====
+# 1. Set Linux paths in .env (EIRDOM_ROOT, STACK_PATH, VAULT_PATH,
+#    MODELS_PATH) instead of the current C:/... Windows paths.
+# 2. To expose on the LAN, set DOCKER_BIND_IP=0.0.0.0 — OR better,
+#    uncomment the Traefik blocks below and reach the UI at
+#    ai.eirdom.homes behind Authentik (keeps it off raw ports).
+# 3. To run Ollama in-compose with the GPU, uncomment the `ollama`
+#    service below and set OLLAMA_BASE_URL=http://ollama:11434 in .env.
+# 4. One-time data copy (named volumes -> the new ./data binds):
+#      docker run --rm -v eirdom-intelligence_qdrant_storage:/from \
+#        -v "$(pwd)/data/qdrant":/to alpine sh -c 'cp -a /from/. /to/'
+#      docker run --rm -v eirdom-intelligence_openwebui_data:/from \
+#        -v "$(pwd)/data/openwebui":/to alpine sh -c 'cp -a /from/. /to/'
+#    (Skip if you're starting the new server fresh.)
+# =============================================================
+
+services:
+
+  # -----------------------------------------------------------
+  # MCPO — MCP gateway (time / filesystem / git tools for the LLM)
+  # NOTE: mounts EIRDOM_ROOT read-WRITE (/repo-rw) so the git MCP can
+  # commit. That is broad write access for an LLM-driven tool — keep
+  # the vault mount read-only (/vault-ro) and review what tools are
+  # enabled in mcpo-config.json.
+  # -----------------------------------------------------------
+  mcpo:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: eirdom-mcpo
+    restart: unless-stopped
+    depends_on:
+      - open-webui
+    ports:
+      - "${DOCKER_BIND_IP}:${MCPO_PORT_BIND}:8000"
+    environment:
+      - TZ=${TZ}
+      - LOCAL_TIMEZONE=${LOCAL_TIMEZONE}
+      - MCPO_API_KEY=${MCPO_API_KEY}
+    volumes:
+      - ./mcpo-config.json:/app/mcpo-config.json:ro
+      - ${VAULT_PATH}:/vault-ro:ro
+      - ${EIRDOM_ROOT}:/repo-rw
+    command:
+      - mcpo
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --api-key
+      - ${MCPO_API_KEY}
+      - --config
+      - /app/mcpo-config.json
+
+  # -----------------------------------------------------------
+  # Qdrant — vector store for RAG
+  # Bind-mounted (was a named volume) so it's backed up with the
+  # stack and easy to relocate. localhost-only via DOCKER_BIND_IP.
+  # -----------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: eirdom-qdrant
+    restart: unless-stopped
+    ports:
+      - "${DOCKER_BIND_IP}:${QDRANT_PORT_BIND}:6333"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+
+  # -----------------------------------------------------------
+  # Open WebUI — chat UI + RAG front-end
+  # Talks to Ollama via ${OLLAMA_BASE_URL} (host today; flip to
+  # http://ollama:11434 in .env when Ollama moves in-compose).
+  # -----------------------------------------------------------
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:latest
+    container_name: eirdom-webui
+    restart: unless-stopped
+    depends_on: [qdrant]
+    ports:
+      - "${DOCKER_BIND_IP}:${OPENWEBUI_PORT_BIND}:8080"
+    environment:
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - WEBUI_NAME=${WEBUI_NAME}
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      - VECTOR_DB=qdrant
+      - QDRANT_URI=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - RAG_EMBEDDING_ENGINE=ollama
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/openwebui:/app/backend/data
+    # ---- Expose via Traefik on the server (uncomment there) ----
+    # Requires the external `proxy` network (exists on the Docker
+    # host, not on the Windows box) — see the networks block at the
+    # bottom. chain-admin = Authentik SSO + VLAN-10 allowlist, the
+    # safer choice given this UI can reach your vault and repo.
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.ai.rule=Host(`ai.${ROOT_DOMAIN}`)"
+    #   - "traefik.http.routers.ai.entrypoints=websecure"
+    #   - "traefik.http.routers.ai.tls=true"
+    #   - "traefik.http.routers.ai.tls.certresolver=cloudflare"
+    #   - "traefik.http.services.ai.loadbalancer.server.port=8080"
+    #   - "traefik.http.routers.ai.middlewares=chain-admin@file"
+    #   - "traefik.docker.network=proxy"
+    # networks: [default, proxy]
+
+  # ===========================================================
+  # OLLAMA — uncomment when running on a dedicated GPU server.
+  # Then set OLLAMA_BASE_URL=http://ollama:11434 in .env so Open
+  # WebUI uses this container instead of host.docker.internal.
+  # Needs nvidia-container-toolkit installed on the host for the
+  # GPU reservation below.
+  # ===========================================================
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: eirdom-ollama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${DOCKER_BIND_IP}:11434:11434"
+  #   environment:
+  #     - OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION}
+  #     # Big-RAM box: keep models resident longer (default 5m)
+  #     # - OLLAMA_KEEP_ALIVE=30m
+  #     # Allow parallel requests if the GPU has headroom
+  #     # - OLLAMA_NUM_PARALLEL=2
+  #   volumes:
+  #     # Model store — point MODELS_PATH at a fast, roomy disk
+  #     - ${MODELS_PATH}:/root/.ollama
+  #   # ---- NVIDIA GPU passthrough ----
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all          # or a number, e.g. 1
+  #             capabilities: [gpu]
+  #   # ---- AMD ROCm alternative (use INSTEAD of the deploy block) ----
+  #   # devices:
+  #   #   - /dev/kfd
+  #   #   - /dev/dri
+
+# ---- Uncomment on the server if exposing Open WebUI via Traefik ----
+# networks:
+#   proxy:
+#     external: true

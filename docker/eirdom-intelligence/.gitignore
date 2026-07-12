@@ -1,0 +1,17 @@
+# Secrets — NEVER commit
+.env
+
+# Open WebUI / SQLite databases (contain user accounts, password
+# hashes, chat history, API keys). webui.db is currently sitting in
+# this directory — remove it from tracking: `git rm --cached webui.db`
+*.db
+*.sqlite
+*.sqlite3
+webui.db
+
+# Runtime data (bind mounts)
+data/
+
+# Local model store if kept inside the stack dir
+models/
+ollama/
